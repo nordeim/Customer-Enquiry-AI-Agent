@@ -1,0 +1,10 @@
+singapore-smb-support-agent/
+├── backend/
+├── frontend/
+├── infrastructure/
+├── docs/
+├── .env.example
+├── .gitignore
+├── README.md
+├── Makefile
+└── docker-compose.yml
