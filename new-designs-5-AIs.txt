@@ -1,0 +1,15 @@
+Design Competition: Production-Ready AI Agent for Singapore SMBs
+
+Please refer to the chat links below to see which AI produces the best implementation of a Customer Support AI Agent featuring RAG (Retrieval Augmented Generation), memory management and a modern React interface.
+
+Each link represents a cutting-edge implementation of a production-ready, enterprise-grade solution. They are better than what 99% of humans can produce.
+
+https://chat.deepseek.com/share/kt5za46ywccg2mje13
+
+https://chat.qwen.ai/s/a8ead116-616e-4eb4-bb69-6b0a4ed628b5?fev=0.1.29
+
+https://chat.z.ai/s/e61cc1e9-c7e1-4c65-afa7-e98e4673ceae
+
+https://www.kimi.com/share/19b64737-8d92-80a6-8000-00008e935075
+
+https://aistudio.google.com/app/prompts?state=%7B%22ids%22:%5B%221iOCBvxv1BgE8MwhnWKW3ujFMzmsvoul8%22%5D,%22action%22:%22open%22,%22userId%22:%22103961307342447084491%22,%22resourceKeys%22:%7B%7D%7D&usp=sharing
