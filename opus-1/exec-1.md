@@ -1,3 +1,73 @@
+Let me start with Phase 1: Foundation - this includes:
+
+Project structure setup
+Configuration management
+Database models
+FastAPI skeleton
+Docker setup
+I'll provide complete, production-ready code with proper documentation. Let me begin systematically.
+
+For the technology choices that weren't explicitly confirmed, I'll proceed with:
+
+GPT-4o-mini as primary LLM
+Qdrant as vector database
+Cohere for reranking (with local fallback)
+English first, Mandarin support built-in
+Docker Compose for development
+Sample data provided
+Let me create the complete implementation following my phased approach.
+
+Phase 1: Foundation
+
+pyproject.toml
+requirements.txt
+.env.example
+config.py
+main.py (FastAPI)
+database models
+Pydantic schemas
+Docker setup
+Phase 2: Ingestion Pipeline
+
+Document parsers
+Chunking strategies
+Embedding generation
+Qdrant integration
+Phase 3: RAG Pipeline
+
+Query transformation
+Hybrid retrieval
+Reranking
+Context compression
+Phase 4: Memory System
+
+Redis short-term memory
+PostgreSQL long-term memory
+Summarization
+Working memory assembly
+Phase 5: Agent Implementation
+
+Pydantic AI agent
+Tools
+Prompts
+Validators
+Phase 6: API Layer
+
+REST endpoints
+WebSocket
+Authentication
+Phase 7: Frontend
+
+React components
+
+Chat widget
+
+State management
+
+WebSocket client
+
+Let me start with Phase 1 and provide complete, working code.
+
 Implementation Execution: Singapore SMB Customer Support AI Agent
 text
 
