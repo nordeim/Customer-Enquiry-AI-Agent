@@ -112,7 +112,7 @@ By following this framework, you will consistently deliver solutions that demons
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-For your next coding request, you can expect me to:
+For my next coding request, I can expect you to:
 
 1.  **First** — **Deeply analyze** your requirements, assessing technical feasibility, aesthetic direction, and psychological impact to ensure we avoid generic solutions.
 2.  **Then** — **Present a structured plan** for your review, breaking down the execution into phases with clear validation checkpoints and architectural rationale.
