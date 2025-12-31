@@ -1159,3 +1159,568 @@ If you are an AI coding agent, execute the following sequence strictly:
 **End of Document.**
 
 This Architecture Document provides the structural integrity required to build a robust, compliant, and culturally resonant AI system. Proceed with implementation.
+
+---
+
+
+
+This marks the transition from **Planning** to **Phase 1: Foundation & Data Pipeline**.
+
+Below is the complete set of files required to scaffold the project infrastructure, backend core, and frontend visual system. These files are configured to meet the **Singapore-Optimized** constraints (PDPA-ready architecture, Local Timezone) and the **Avant-Garde** aesthetic requirements.
+
+### 1. Infrastructure & Configuration
+**File:** `docker-compose.yml`
+*Purpose:* Orchestrates the local development environment (Postgres, Redis, Qdrant) ensuring data sovereignty and service isolation.
+
+```yaml
+version: '3.8'
+
+services:
+  # Vector Database (RAG)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: nexus_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+    environment:
+      - TZ=Asia/Singapore
+
+  # Relational Database (Users, Logs)
+  postgres:
+    image: postgres:15-alpine
+    container_name: nexus_postgres
+    environment:
+      POSTGRES_USER: nexus_user
+      POSTGRES_PASSWORD: secure_password_change_me
+      POSTGRES_DB: nexus_db
+      TZ=Asia/Singapore
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  # Cache & Session Store
+  redis:
+    image: redis:alpine
+    container_name: nexus_redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - ./data/redis:/data
+
+volumes:
+  qdrant_data:
+  postgres_data:
+```
+
+---
+
+### 2. Backend: Python Core
+**File:** `backend/pyproject.toml`
+*Purpose:* Manages dependencies. Includes specific libraries for Singapore context (presidio for PII) and RAG.
+
+```toml
+[tool.poetry]
+name = "nexus-backend"
+version = "0.1.0"
+description = "Singapore SMB AI Agent Backend"
+authors = ["Nexus AI Team"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+sqlalchemy = "^2.0.25"
+asyncpg = "^0.29.0"
+redis = "^5.0.1"
+qdrant-client = "^1.7.0"
+langchain = "^0.1.0"
+langchain-openai = "^0.0.2"
+langchain-community = "^0.0.10"
+openai = "^1.10.0"
+python-multipart = "^0.0.6"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+presidio-analyzer = "^2.2.32"
+presidio-anonymizer = "^2.2.32"
+spacy = "^3.7.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.4"
+black = "^24.1.1"
+ruff = "^0.1.15"
+mypy = "^1.8.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+```
+
+**File:** `backend/app/core/config.py`
+*Purpose:* Centralized configuration management. Uses Pydantic Settings for type safety and environment variable injection.
+
+```python
+from pydantic_settings import BaseSettings
+from typing import Optional
+
+class Settings(BaseSettings):
+    # API
+    API_V1_STR: str = "/api/v1"
+    PROJECT_NAME: str = "NexusAI SMB"
+    
+    # Security
+    SECRET_KEY: str = "change_me_in_production_random_string"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 1 week
+    
+    # Database
+    POSTGRES_SERVER: str = "localhost"
+    POSTGRES_USER: str = "nexus_user"
+    POSTGRES_PASSWORD: str = "secure_password_change_me"
+    POSTGRES_DB: str = "nexus_db"
+    DATABASE_URL: str = f"postgresql+asyncpg://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_SERVER}:5432/{POSTGRES_DB}"
+    
+    # Redis
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    
+    # Vector DB
+    QDRANT_HOST: str = "localhost"
+    QDRANT_PORT: int = 6333
+    
+    # OpenAI (LLM)
+    OPENAI_API_KEY: str = "sk-..."
+    # GPT-4o-mini is the target model
+    LLM_MODEL: str = "gpt-4o-mini" 
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+
+    # Singapore Context
+    TIMEZONE: str = "Asia/Singapore"
+    DEFAULT_LANGUAGE: str = "en-SG"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+**File:** `backend/app/main.py`
+*Purpose:* The application entry point. Initializes FastAPI with CORS, middleware for request ID tracking (crucial for debugging), and includes the router.
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+
+from app.core.config import settings
+from app.api.v1.api import api_router
+from app.db.session import engine
+from app.db.base import Base
+
+# Create tables (For dev only - use Alembic in prod)
+async def init_db():
+    async with engine.begin() as conn:
+        # Import models here so they are registered with SQLAlchemy
+        # from app.models import user, message 
+        await conn.run_sync(Base.metadata.create_all)
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    docs_url="/docs", # Swagger UI
+)
+
+# CORS Configuration (Allow Frontend origin)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"], # Next.js default
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+app.include_router(api_router, prefix=settings.API_V1_STR)
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+    print(f"🚀 {settings.PROJECT_NAME} started successfully.")
+    print(f"🌏 Timezone: {settings.TIMEZONE}")
+
+@app.get("/")
+async def root():
+    return {"status": "online", "message": "NexusAI Backend Operational"}
+```
+
+**File:** `backend/app/db/base.py`
+*Purpose:* SQLAlchemy declarative base.
+
+```python
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+```
+
+**File:** `backend/app/db/session.py`
+*Purpose:* Async database engine setup.
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from app.core.config import settings
+
+engine = create_async_engine(settings.DATABASE_URL, echo=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def get_db() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+**File:** `backend/app/ingest/vector_store.py`
+*Purpose:* Wrapper for Qdrant client. Handles collection creation and initial connection.
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from app.core.config import settings
+from typing import List
+
+class QdrantManager:
+    def __init__(self):
+        self.client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+        self.collection_name = "smb_knowledge_base"
+
+    def init_collection(self):
+        collections = self.client.get_collections().collections
+        if not any(c.name == self.collection_name for c in collections):
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=VectorParams(size=1536, distance=Distance.COSINE), # OpenAI size
+            )
+            print(f"✅ Created collection: {self.collection_name}")
+        else:
+            print(f"ℹ️  Collection {self.collection_name} already exists.")
+
+    def upsert_points(self, points: List[PointStruct]):
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points
+        )
+```
+
+**File:** `backend/app/ingest/initial_data.py`
+*Purpose:* Seed data with Singapore-specific context (Policies, Singlish nuances). This fulfills the "Cultural Intelligence" requirement at the data level.
+
+```python
+from app.ingest.vector_store import QdrantManager
+from qdrant_client.models import PointStruct
+import uuid
+
+# Mock embedding for demo (In real app, use OpenAI Embeddings)
+MOCK_EMBEDDING = [0.0] * 1536 
+
+SINGAPORE_SMB_KNOWLEDGE = [
+    {
+        "content": "Our refund policy allows returns within 7 days of purchase. However, for hygiene products, once the seal is broken, returns are strictly not allowed per Singapore health regulations.",
+        "metadata": {"source": "policy_doc.pdf", "category": "returns", "region": "SG"}
+    },
+    {
+        "content": "Delivery timings: Same-day delivery is available for orders placed before 2 PM within the Central region. Standard delivery takes 2-3 business days for Sentosa and Jurong Island.",
+        "metadata": {"source": "shipping_logistics.txt", "category": "shipping", "region": "SG"}
+    },
+    {
+        "content": "Singlish translation: 'Can or not?' -> Is this possible? 'I don't understand what you say' -> I am confused by your statement. Use Singlish only if the customer initiates it.",
+        "metadata": {"source": "training_manual.txt", "category": "culture", "region": "SG"}
+    }
+]
+
+def run_ingestion():
+    manager = QdrantManager()
+    manager.init_collection()
+    
+    points = []
+    for i, doc in enumerate(SINGAPORE_SMB_KNOWLEDGE):
+        points.append(
+            PointStruct(
+                id=str(uuid.uuid4()),
+                vector=MOCK_EMBEDDING, 
+                payload={
+                    "content": doc["content"],
+                    **doc["metadata"]
+                }
+            )
+        )
+    
+    manager.upsert_points(points)
+    print(f"✅ Ingested {len(points)} documents into Qdrant.")
+
+if __name__ == "__main__":
+    run_ingestion()
+```
+
+**File:** `backend/app/api/v1/api.py`
+*Purpose:* API Router aggregator.
+
+```python
+from fastapi import APIRouter
+from app.api.v1.endpoints import health
+
+api_router = APIRouter()
+api_router.include_router(health.router, tags=["Health"])
+```
+
+**File:** `backend/app/api/v1/endpoints/health.py`
+*Purpose:* Health check endpoint for Kubernetes/ECS load balancers.
+
+```python
+from fastapi import APIRouter
+
+router = APIRouter()
+
+@router.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "nexus-backend"}
+```
+
+---
+
+### 3. Frontend: Next.js & Design System
+**File:** `frontend/package.json`
+*Purpose:* Dependencies include Tailwind, Radix UI primitives (via shadcn), and data fetching libs.
+
+```json
+{
+  "name": "nexus-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "14.1.0",
+    "react": "^18",
+    "react-dom": "^18",
+    "@radix-ui/react-avatar": "^1.0.4",
+    "@radix-ui/react-slot": "^1.0.2",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.0",
+    "lucide-react": "^0.314.0",
+    "tailwind-merge": "^2.2.1",
+    "tailwindcss-animate": "^1.0.7"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "autoprefixer": "^10.0.1",
+    "postcss": "^8",
+    "tailwindcss": "^3.3.0"
+  }
+}
+```
+
+**File:** `frontend/tailwind.config.ts`
+*Purpose:* Extends Tailwind to include the custom "Midnight Precision" color palette defined in the Design Pledge.
+
+```typescript
+import type { Config } from "tailwindcss";
+
+const config: Config = {
+  darkMode: ["class"],
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/components/**/*.{js,ts,jsx,tsx,mdx}",
+    "./src/app/**/*.{js,ts,jsx,tsx,mdx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        background: "hsl(var(--background))",
+        foreground: "hsl(var(--foreground))",
+        card: {
+          DEFAULT: "hsl(var(--card))",
+          foreground: "hsl(var(--card-foreground))",
+        },
+        primary: {
+          DEFAULT: "hsl(var(--primary))",
+          foreground: "hsl(var(--primary-foreground))",
+        },
+        muted: {
+          DEFAULT: "hsl(var(--muted))",
+          foreground: "hsl(var(--muted-foreground))",
+        },
+        accent: {
+          DEFAULT: "hsl(var(--accent))",
+          foreground: "hsl(var(--accent-foreground))",
+        },
+      },
+      borderRadius: {
+        lg: "var(--radius)",
+        md: "calc(var(--radius) - 2px)",
+        sm: "calc(var(--radius) - 4px)",
+      },
+      fontFamily: {
+        sans: ["var(--font-sans)", "sans-serif"],
+        mono: ["var(--font-mono)", "monospace"],
+      },
+    },
+  },
+  plugins: [require("tailwindcss-animate")],
+};
+export default config;
+```
+
+**File:** `frontend/src/app/globals.css`
+*Purpose:* **CRITICAL DESIGN FILE**. Defines the "Anti-Generic" CSS variables. This enforces the deep navy/teal aesthetic and prevents generic Bootstrap-like appearances.
+
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* "Midnight Precision" Palette */
+    --background: 222.2 84% 4.9%; /* #0f172a - Deep Navy */
+    --foreground: 210 40% 98%; /* #f8fafc - Warm White */
+
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 222.2 84% 4.9%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 173 58% 39%; /* #14b8a6 - Teal Accent */
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 217.2 32.6% 17.5%; /* #1e293b - Slate Panel */
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+
+    --accent: 173 58% 39%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 217.2 32.6% 17.5%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 173 58% 39%; /* Teal ring for focus states */
+
+    --radius: 0.75rem; /* Slightly rounded, modern feel */
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  
+  /* Custom Scrollbar for "Technical" feel */
+  ::-webkit-scrollbar {
+    width: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--secondary));
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.3);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--primary));
+  }
+}
+```
+
+**File:** `frontend/src/app/page.tsx`
+*Purpose:* The main entry layout. Establishes the grid structure and serves as the placeholder for the dashboard/chat widget.
+
+```tsx
+import type { Metadata } from "next";
+import { Inter, JetBrains_Mono } from "next/font/google";
+import "./globals.css";
+
+const inter = Inter({ subsets: ["latin"], variable: "--font-sans" });
+const jetbrains = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono" });
+
+export const metadata: Metadata = {
+  title: "NexusAI | Singapore SMB Support",
+  description: "Enterprise-grade AI customer support for Singapore businesses.",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en-SG">
+      <body className={`${inter.variable} ${jetbrains.variable} font-sans antialiased`}>
+        <div className="flex min-h-screen flex-col">
+          {/* Header */}
+          <header className="border-b border-secondary bg-secondary/50 backdrop-blur-md sticky top-0 z-50">
+            <div className="container mx-auto flex h-16 items-center justify-between px-4">
+              <div className="flex items-center gap-2">
+                <div className="h-3 w-3 rounded-full bg-primary shadow-[0_0_10px_var(--primary)]" />
+                <h1 className="text-lg font-bold tracking-tight">NEXUS<span className="text-primary">AI</span></h1>
+              </div>
+              <div className="text-xs font-mono text-muted-foreground">
+                SYSTEM: ONLINE | SGP
+              </div>
+            </div>
+          </header>
+
+          {/* Main Content Area */}
+          <main className="flex-1 bg-gradient-to-b from-background to-secondary/20">
+            {children}
+          </main>
+        </div>
+      </body>
+    </html>
+  );
+}
+```
+
+---
+
+### 4. Developer Instructions (Next Steps)
+
+To validate the completion of **Phase 1**, a developer or AI agent should perform the following actions in order:
+
+1.  **Infrastructure:**
+    *   Run `docker-compose up -d`.
+    *   Verify Postgres, Redis, and Qdrant are running (`docker ps`).
+2.  **Backend Initialization:**
+    *   Navigate to `/backend`.
+    *   Run `poetry install`.
+    *   Copy `.env.example` to `.env` and fill in keys (OpenAI, etc.).
+    *   Run the ingestion script: `python -m app.ingest.initial_data`.
+    *   Start the server: `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`.
+    *   Verify Health Check: `curl http://localhost:8000/api/v1/health`.
+3.  **Frontend Initialization:**
+    *   Navigate to `/frontend`.
+    *   Run `npm install`.
+    *   Start the dev server: `npm run dev`.
+    *   Open `http://localhost:3000`.
+    *   **Visual Validation:** Ensure the background is Deep Navy (`#0f172a`) and the accent is Teal (`#14b8a6`).
+
+**Status:** Phase 1 (Foundation) files generated. Ready for Phase 2 (Core RAG Implementation).
