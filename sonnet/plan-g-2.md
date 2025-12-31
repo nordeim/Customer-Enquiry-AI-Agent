@@ -511,3 +511,287 @@ nexus-ai-smb/
 ---
 
 This document serves as the **Single Source of Truth**. Any deviation from the "Singapore-First" or "Avant-Garde" principles requires explicit architectural review.
+
+---
+
+This is the **Refined, Comprehensive Project Architecture Document (PAD)**.
+
+I have conducted a "Red Team" critique of the previous version to identify gaps in data synchronization, error handling, and state management. This updated version includes **concrete implementation logic, explicit data schemas, and edge-case handling protocols**, removing ambiguity for developers and agents alike.
+
+---
+
+# PROJECT ARCHITECTURE DOCUMENT (PAD)
+**Project Name:** NexusAI SMB (Singapore Edition)
+**Version:** 2.0.0-Robust
+**Status:** Approved for Build
+**Architecture Style:** Event-Driven Modular Monolith
+**Single Source of Truth:** YES
+
+---
+
+## 1. Executive Vision & Constraints
+
+### 1.1 The "Why" & "How"
+We are building the "Operating System" for a Singaporean SMB's customer service. It is not just a chatbot; it is a **culturally intelligent automation layer**.
+*   **The Vibe:** "Tropical Brutalism." Functional, high-contrast, offline-resilient, no-nonsense.
+*   **The Economics:** Must run on **<$50/month** infrastructure (Railway/Render + OpenAI API).
+*   **The Culture:** It must understand that "Can" and "Can lah" imply different levels of certainty.
+
+### 1.2 Non-Negotiable Constraints
+1.  **Strict Typing:** Python (`Pydantic v2`), TypeScript (`Zod`). No `any` types allowed.
+2.  **Compliance:** PII (NRIC/FIN/Phone) is **never** persisted in the LLM context or Vector DB in plain text.
+3.  **Latency:** API response < 200ms (ACK). LLM Streaming TTFT < 1.5s.
+4.  **Sync:** WhatsApp and the Web Dashboard must be perfectly synchronized via Redis Pub/Sub.
+
+---
+
+## 2. System Architecture & Data Flow
+
+### 2.1 Component Architecture
+
+```mermaid
+graph TD
+    %% CLIENTS
+    WA[WhatsApp User] <-->|Webhook| API[FastAPI Gateway]
+    Owner[Business Owner] <-->|WebSocket| API
+
+    %% CORE SERVICES
+    subgraph "Backend Core (Python/FastAPI)"
+        Auth[Auth Middleware]
+        PII[Presidio Redactor]
+        
+        subgraph "LangGraph Agent"
+            Router{Intent Router}
+            Recall[Memory Manager]
+            RAG[Qdrant Retriever]
+            LLM[GPT-4o-mini]
+            Singlish[SG Context Adaptor]
+        end
+        
+        PubSub[Redis Pub/Sub]
+    end
+
+    %% DATA PERSISTENCE
+    subgraph "Storage Layer"
+        PG[(PostgreSQL - Users/Logs)]
+        Vec[(Qdrant - Knowledge)]
+        Redis[(Redis - State/Cache)]
+    end
+
+    %% FLOWS
+    API --> Auth --> PII --> Router
+    Router -->|Query| RAG --> Vec
+    Router -->|State| Recall --> Redis
+    Router -->|Generate| LLM
+    LLM -->|Adapt| Singlish
+    Singlish -->|Response| API
+    
+    %% SYNC
+    API -->|Publish Event| PubSub
+    PubSub -->|Push Update| Owner
+```
+
+### 2.2 detailed Request Lifecycle (The "Hot" Path)
+
+1.  **Ingress:** Meta POSTs payload to `/api/v1/webhook/whatsapp`.
+2.  **Validation:** Verify `X-Hub-Signature-256`. Drop if invalid.
+3.  **Normalization:** Convert Meta JSON to internal `UserMessage` model.
+4.  **Async Handoff:**
+    *   **Immediate:** Push `message_received` event to Redis (updates Dashboard).
+    *   **Background Task:** Trigger `agent_workflow.invoke(state)`.
+5.  **PII Scrubbing:** Scan text for NRIC `[S|T|F|G]\d{7}[A-Z]`. Replace with `<REDACTED_NRIC>`.
+6.  **Agent Logic (LangGraph):**
+    *   *Check Cache:* Is there a valid semantic hit in Redis for this exact query?
+    *   *Retrieve:* Hybrid search in Qdrant (BM25 + Cosine).
+    *   *Reason:* LLM determines answer.
+7.  **Egress:**
+    *   Send WhatsApp via Graph API.
+    *   Push `agent_response` event to Redis (updates Dashboard).
+    *   Log sanitized conversation to PostgreSQL.
+
+---
+
+## 3. Module Specifications & Logic
+
+### 3.1 `packages/sg_context`: The Cultural Engine
+*Location: `backend/app/packages/sg_context/`*
+
+**A. Singlish Normalizer (`normalizer.py`)**
+Do not "translate" Singlish to Queen's English (loss of intent). Instead, **annotate** it.
+```python
+SINGLISH_TOKENS = {
+    "can or not": {"intent": "feasibility_check", "sentiment": "neutral"},
+    "wa lau": {"intent": "frustration_marker", "sentiment": "negative"},
+    "chk": {"intent": "check", "sentiment": "neutral"},
+    "tomolo": {"intent": "tomorrow", "sentiment": "neutral"}
+}
+
+def annotate_singlish(text: str) -> str:
+    # Logic: Append intent metadata for the LLM without altering user text
+    # Input: "Delivery tomolo can or not?"
+    # Output: "Delivery tomolo can or not? [[Intent: check_feasibility, Time: tomorrow]]"
+    pass
+```
+
+**B. PDPA Guard (`privacy.py`)**
+*   **Logic:** Use `presidio-analyzer` with custom patterns.
+*   **Edge Case:** If a user sends an image of an NRIC, the `ImageProcessor` (utilizing GPT-4o-Vision) must flag it as `CONFIDENTIAL_IMAGE` and not describe the ID numbers in text.
+
+### 3.2 The Agent (LangGraph)
+*Location: `backend/app/agent/`*
+
+**State Definition:**
+```python
+class AgentState(TypedDict):
+    session_id: str
+    messages: list[BaseMessage]
+    user_tier: str # 'standard', 'vip'
+    sentiment_history: list[float] # Rolling average
+    language_mode: str # 'en-SG', 'zh-SG', 'singlish'
+    handoff_flag: bool # If True, stop AI
+```
+
+**Graph Nodes:**
+1.  **`intent_classifier`**:
+    *   If intent == `complaint` AND sentiment < -0.7 $\to$ **Escalate**.
+    *   If intent == `complex_policy` $\to$ **DeepRAG**.
+    *   Else $\to$ **QuickReply**.
+2.  **`deep_rag`**:
+    *   Query Qdrant with `top_k=5`.
+    *   Re-rank results based on `last_updated` date (Primacy of recent policies).
+3.  **`response_generator`**:
+    *   System Prompt must include: *"You are a pragmatic Singaporean assistant. Be concise. Use 'S$' for currency. If the user uses Singlish, mirror their formality level slightly, but remain professional."*
+
+---
+
+## 4. Data Architecture & Schemas
+
+### 4.1 PostgreSQL (Relational)
+*   **`users`**: `id`, `wa_id` (index), `name`, `consent_given_at` (Timestamp), `is_blocked`.
+*   **`conversations`**: `id`, `user_id`, `status` (open/closed/human_pending), `summary`.
+*   **`messages`**: `id`, `conversation_id`, `sender` (user/ai/system), `content_encrypted`, `content_sanitized`, `timestamp`.
+    *   *Note:* `content_encrypted` stores the raw text (for legal/audit), `content_sanitized` is used for display/training.
+
+### 4.2 Qdrant (Vector)
+*   **Collection:** `smb_knowledge`
+*   **Payload:**
+    ```json
+    {
+      "text": "...",
+      "metadata": {
+        "doc_id": "return_policy_v2",
+        "hash": "sha256...",
+        "access_level": "public", 
+        "expiry_date": "2025-12-31" 
+      }
+    }
+    ```
+*   **Edge Case:** If `expiry_date` < Today, the filter **must** exclude this chunk.
+
+### 4.3 Redis (Transient)
+*   **Key:** `session:{wa_id}` $\to$ JSON (Conversation History - Last 10 turns).
+*   **Key:** `rate_limit:{wa_id}` $\to$ Integer.
+*   **Channel:** `live_updates` (Pub/Sub for Dashboard).
+
+---
+
+## 5. API Contract (Backend <-> Frontend)
+
+### 5.1 WebSocket: `/api/v1/ws/dashboard`
+**Authentication:** JWT in Query Param or Cookie.
+
+**Events (Server -> Client):**
+1.  `new_message`:
+    ```json
+    {
+      "type": "new_message",
+      "data": {
+        "conversation_id": "uuid",
+        "sender": "user",
+        "text": "Price for this?",
+        "sentiment": 0.1
+      }
+    }
+    ```
+2.  `agent_thought`: (Visualizes the "Brain" for the owner)
+    ```json
+    {
+      "type": "agent_thought",
+      "data": {
+        "step": "retrieving_context",
+        "query": "price list 2025"
+      }
+    }
+    ```
+
+**Events (Client -> Server):**
+1.  `takeover_control`: `{ "conversation_id": "uuid", "action": "pause_ai" }`
+2.  `send_message`: `{ "conversation_id": "uuid", "text": "I will handle this." }`
+
+---
+
+## 6. Frontend specifications (Next.js)
+
+### 6.1 Design System: "Midnight Precision"
+*   **CSS Variables (Tailwind 4):**
+    *   `--bg-canvas`: `#0B0F19` (Void)
+    *   `--bg-panel`: `#161B28` (Charcoal)
+    *   `--text-primary`: `#F1F5F9` (Ice)
+    *   `--accent`: `#06B6D4` (Cyan - specific to tech/cleanliness)
+    *   `--alert`: `#FF4D4D` (Signal Red)
+*   **Typography:**
+    *   Headings: `Inter Tight` (Tracking -0.02em).
+    *   Data/Logs: `JetBrains Mono` (Ligatures enabled).
+
+### 6.2 Directory Structure
+```text
+apps/web/
+├── components/
+│   ├── ui/ (Shadcn primitives - customized)
+│   ├── dashboard/
+│   │   ├── ChatConsole.tsx (The main WhatsApp-style view)
+│   │   ├── LiveFeed.tsx (Sidebar list of active chats)
+│   │   └── AgentBrain.tsx (Visualizer for LangGraph steps)
+├── lib/
+│   ├── socket.ts (Robust WS client with reconnection logic)
+│   └── api.ts (Typed fetch wrappers)
+```
+
+---
+
+## 7. Edge Case Protocol
+
+| Scenario | System Behavior |
+| :--- | :--- |
+| **Meta API Outage** | 1. Log error. <br> 2. Queue outgoing messages in Redis `retry_queue`. <br> 3. Cron job retries every 60s. |
+| **User Spams Messages** | 1. Redis Rate Limiter triggers (e.g., >5 msgs/10s). <br> 2. Agent ignores input. <br> 3. Send system message: *"Whoa, too fast! Give me a sec."* |
+| **Singlish Unrecognized** | 1. If confidence < 0.5, Agent asks clarifying question: *"Paiseh, catch no ball. You mean X or Y?"* |
+| **PII Leak Attempt** | 1. Output Guardrail detects pattern in Agent response. <br> 2. Blocks response. <br> 3. Sends fallback: *"I cannot process that request due to privacy rules."* |
+
+---
+
+## 8. Implementation Guide (For Agents)
+
+### Phase 1: Infrastructure & Core
+1.  **Init:** Setup Docker Compose with Postgres, Redis, Qdrant. Ensure `TZ=Asia/Singapore` is set in all containers.
+2.  **DB:** Run Alembic migrations to create tables defined in Section 4.1.
+3.  **Lib:** Create `sg_context` package. Write unit tests for `singlish_detector` before implementing it.
+
+### Phase 2: Backend Logic
+1.  **FastAPI:** Implement `/webhook` with signature verification.
+2.  **RAG:** Implement `QdrantService`. Ensure payload includes `access_level`.
+3.  **Agent:** Build LangGraph. Test the `human_escalation` node manually.
+
+### Phase 3: Frontend Construction
+1.  **Theme:** Configure `globals.css` with "Midnight Precision" variables.
+2.  **WebSocket:** Implement `useSocket` hook with auto-reconnect.
+3.  **Dashboard:** Build the 3-pane layout (Chat List | Active Chat | Agent Brain).
+
+### Phase 4: Integration
+1.  **Connect:** Wire Webhook -> PubSub -> Frontend.
+2.  **Verify:** Send a message from a real WhatsApp test number. Ensure it appears on the Dashboard < 200ms.
+
+---
+
+**End of Document.**
+This PAD is the definitive instruction set. No deviations allowed without updating the version number.
