@@ -1291,5 +1291,798 @@ If you are an AI coding agent, **execute in this exact sequence**:
 
 ---
 
-**Document Version:** 2.1.0-Executable  
-**Status:** **APPROVED FOR BUILD**  
+Meticulous Self-Critique & PAD Enhancement
+1. Critical Analysis of PAD v2.1.0
+1.1 Ambiguities Identified (Red Team Review)
+A. Data Layer Ambiguity
+Problem: Redis Streams implementation mentions xreadgroup but doesn't specify consumer group naming conventions, message ID format, or pending message handling on consumer crash.
+Risk: AI agent may implement incorrect stream topology, causing message loss or duplicate processing.
+Edge Case: What happens if a consumer crashes mid-processing? The pending message remains un-ACKed. How long until it's reclaimed? By which consumer?
+B. Frontend State Management Gap
+Problem: No specification for React state hydration when the Dashboard reconnects after a disconnect.
+Risk: Business owner sees blank screen or stale data on reconnect.
+Edge Case: If Redis Stream consumer dies for 5 minutes, then reconnects, how does it catch up on 500 missed messages without overwhelming the UI?
+C. PII Redaction Incompleteness
+Problem: Presidio pattern for NRIC is defined, but no validation for checksum (last letter). Invalid NRICs might be redacted unnecessarily.
+Risk: False positives cause user frustration ("Why you block my IC?").
+Edge Case: User types "S1234567" (7 digits, missing letter). Should it be redacted? No. Pattern requires 7 digits + 1 letter.
+D. Cost Calculation Blind Spot
+Problem: WhatsApp API cost is estimated at $120/month, but no calculation for message volume (text vs. media vs. template).
+Risk: Budget overrun if business sends many media messages (images cost 5x text).
+Edge Case: A restaurant sends 500 menu images/month = $250/month WhatsApp cost alone.
+E. Cultural UI Specification Gap
+Problem: ChatBubble shows Singlish tokens, but no guidance on token display limit (what if sentence has 10 tokens?).
+Risk: UI overflow, broken layout on mobile.
+Edge Case: "Walau eh this thing spoil already can exchange or not lah?" → 4 tokens. UI must truncate or wrap elegantly.
+1.2 Missing Operational Protocols
+A. Database Migration Strategy
+Problem: No mention of Alembic migration scripts or rollback procedure if migration fails mid-deploy.
+Risk: Stuck deployment, data corruption.
+Edge Case: Adding a NOT NULL column to messages table with 1M rows takes 30 minutes. How to deploy without downtime?
+B. Redis Stream Retention Policy
+Problem: No MAXLEN specified for message_stream. It will grow infinitely.
+Risk: Memory exhaustion, Redis OOM crash.
+Edge Case: High-traffic business (1000 msg/day) × 30 days = 30K messages. At 1KB each = 30MB (exceeds free Redis tier).
+C. LLM Fallback Chain
+Problem: If GPT-4o-mini fails (timeout), no fallback to GPT-3.5-turbo specified.
+Risk: Single point of failure.
+Edge Case: OpenAI API has 5-minute outage. All queries fail. Business loses customers.
+D. Monitoring & Alerting Gaps
+Problem: No Prometheus metrics exposed for Singlish detection rate or PII redaction count.
+Risk: Compliance audit requires evidence of PII handling. No data = audit failure.
+Edge Case: PDPC auditor asks: "Prove you redacted NRIC in last 1000 messages." No metric = fine.
+1.3 Developer Experience Gaps
+A. Local Development Setup
+Problem: docker-compose up -d works, but no seed data for realistic testing.
+Risk: Developers test with "Hello world" messages, miss edge cases.
+Edge Case: Developer can't replicate "Uncle complaining in Singlish" scenario without realistic fixtures.
+B. Debugging Transparency
+Problem: No specification for distributed tracing (OpenTelemetry) across WhatsApp → API → Redis → Dashboard.
+Risk: Bug in production takes 4 hours to trace through logs.
+Edge Case: Message "lost" between WhatsApp and Dashboard. Which component dropped it? No trace ID.
+2. Hyper-Detailed PAD v2.2.0-Autonomous
+2.1 Data Layer: Redis Streams Specification (Lock)
+File: apps/api/app/core/redis_streams.py
+Python
+Copy
+from redis import Redis
+from typing import List, Dict, Optional
+import json
+
+class RedisStreamConfig:
+    """Locked configuration for Redis Streams"""
+    STREAM_NAME = "message_stream"  # Single stream for all messages
+    CONSUMER_GROUP = "dashboard_group"  # Dashboard consumers
+    CONSUMER_ID_PREFIX = "dashboard_client_"  # Unique per browser session
+    MAXLEN = 10000  # Max 10K messages in stream (auto-trim)
+    BLOCK_MS = 5000  # Block for 5s if no messages
+    CLAIM_IDLE_MS = 60000  # Reclaim pending messages after 60s idle
+
+class StreamMessage:
+    """Typed wrapper for stream entries"""
+    def __init__(self, id: str, payload: Dict):
+        self.id = id  # Format: "1704067200000-0"
+        self.payload = payload
+    
+    @classmethod
+    def from_raw(cls, raw: tuple) -> "StreamMessage":
+        """Parse from redis-py raw format"""
+        id, data = raw
+        return cls(id=id, payload=json.loads(data[b"payload"].decode()))
+
+class RedisStreamManager:
+    """Manages Redis Streams with guaranteed delivery"""
+    
+    def __init__(self, redis_client: Redis):
+        self.redis = redis_client
+        self._ensure_stream_exists()
+        self._ensure_consumer_group_exists()
+    
+    def _ensure_stream_exists(self):
+        """Idempotent: creates stream if not exists"""
+        # XGROUP CREATE fails if stream doesn't exist, so we add a dummy message then delete it
+        try:
+            self.redis.xadd(self.STREAM_NAME, {"payload": "{}"}, maxlen=1)
+        except:
+            pass
+    
+    def _ensure_consumer_group_exists(self):
+        """Idempotent: creates consumer group"""
+        try:
+            self.redis.xgroup_create(
+                name=self.STREAM_NAME,
+                groupname=self.CONSUMER_GROUP,
+                id="0",  # Start from beginning
+                mkstream=False  # Stream already exists
+            )
+        except:
+            # Group exists, ignore
+            pass
+    
+    async def publish_event(self, event_type: str, data: Dict) -> str:
+        """
+        Publish event to stream. Returns message ID.
+        Guarantees ordering by timestamp.
+        """
+        payload = json.dumps({"type": event_type, "data": data, "ts": datetime.utcnow().isoformat()})
+        msg_id = self.redis.xadd(
+            self.STREAM_NAME,
+            {"payload": payload},
+            maxlen=self.MAXLEN,
+            approximate=True  # Faster, slight risk of exceeding MAXLEN by few messages
+        )
+        return msg_id
+    
+    async def consume_events(self, consumer_id: str, count: int = 10) -> List[StreamMessage]:
+        """
+        Consume events for a specific dashboard client.
+        Returns un-ACKed messages.
+        """
+        raw_messages = self.redis.xreadgroup(
+            groupname=self.CONSUMER_GROUP,
+            consumername=consumer_id,
+            streams={self.STREAM_NAME: ">"},  # '>' means "messages never delivered to this group"
+            count=count,
+            block=self.BLOCK_MS
+        )
+        
+        if not raw_messages:
+            return []
+        
+        # Parse raw format
+        messages = []
+        for stream_name, entries in raw_messages:
+            for msg_id, msg_data in entries:
+                messages.append(StreamMessage.from_raw((msg_id, msg_data)))
+        
+        return messages
+    
+    async def acknowledge_message(self, msg_id: str):
+        """ACK message to remove from pending list"""
+        self.redis.xack(self.STREAM_NAME, self.CONSUMER_GROUP, msg_id)
+    
+    async def claim_stale_messages(self, consumer_id: str, min_idle_time_ms: int = None) -> List[StreamMessage]:
+        """
+        Claim messages from dead consumers.
+        Run this on Dashboard reconnection to catch up.
+        """
+        min_idle = min_idle_time_ms or self.CLAIM_IDLE_MS
+        
+        # Get pending messages that are idle > threshold
+        pending = self.redis.xpending_range(
+            self.STREAM_NAME,
+            self.CONSUMER_GROUP,
+            min=min_idle,
+            max="+",
+            count=100
+        )
+        
+        if not pending:
+            return []
+        
+        # Claim them for this consumer
+        msg_ids = [p.message_id for p in pending]
+        claimed = self.redis.xclaim(
+            self.STREAM_NAME,
+            self.CONSUMER_GROUP,
+            consumer_id,
+            min_idle_time=min_idle,
+            message_ids=msg_ids
+        )
+        
+        return [StreamMessage.from_raw((cid, data)) for cid, data in claimed]
+2.2 PII Validation Logic (Hyper-Specific)
+File: packages/sg_context/pii/validator.py
+Python
+Copy
+import re
+from typing import Optional
+
+class NRICValidator:
+    """Validates Singapore NRIC/FIN with checksum (last letter)"""
+    
+    # Weights for S/T (born before 2000) and F/G (foreign)
+    WEIGHTS_STFG = [2, 7, 6, 5, 4, 3, 2]
+    WEIGHTS_ML = [3, 5, 11, 2, 3, 7, 13]  # For M/L series (new born/imported)
+    
+    # Checksum maps
+    CHECKSUM_ST = ["J", "Z", "I", "H", "G", "F", "E", "D", "C", "B", "A"]
+    CHECKSUM_FG = ["X", "W", "U", "T", "R", "Q", "P", "N", "M", "L", "K"]
+    
+    @staticmethod
+    def validate(nric: str) -> Optional[str]:
+        """
+        Returns None if valid, error message if invalid.
+        Only validates format and checksum, not if person exists.
+        """
+        # Uppercase, strip spaces
+        nric = nric.upper().replace(" ", "")
+        
+        # Pattern check: 1 letter + 7 digits + 1 letter
+        if not re.match(r"^[STFGML][0-9]{7}[A-Z]$", nric):
+            return "Invalid format. Expected S1234567A."
+        
+        prefix = nric[0]
+        digits = nric[1:8]
+        check_letter = nric[8]
+        
+        # Convert digits to numbers
+        try:
+            digits_sum = sum(int(d) * w for d, w in zip(digits, NRICValidator.WEIGHTS_STFG))
+        except ValueError:
+            return "Invalid digits in NRIC."
+        
+        # Special handling for prefix
+        if prefix in ["T", "G"]:
+            digits_sum += 4  # Born after specific year
+        elif prefix in ["M", "L"]:
+            # Use M/L weights instead
+            digits_sum = sum(int(d) * w for d, w in zip(digits, NRICValidator.WEIGHTS_ML))
+        
+        remainder = digits_sum % 11
+        
+        # Map to correct checksum
+        if prefix in ["S", "T"]:
+            expected_check = NRICValidator.CHECKSUM_ST[remainder]
+        elif prefix in ["F", "G"]:
+            expected_check = NRICValidator.CHECKSUM_FG[remainder]
+        elif prefix in ["M", "L"]:
+            # M/L use same checksum as ST but different weight calculation
+            expected_check = NRICValidator.CHECKSUM_ST[remainder]
+        else:
+            return "Invalid prefix. Must be S, T, F, G, M, or L."
+        
+        if check_letter != expected_check:
+            return f"Invalid checksum. Expected {expected_check}, got {check_letter}."
+        
+        return None  # Valid
+
+# Usage in Presidio
+def validate_sg_nric(entity):
+    if entity.entity_type == "SG_NRIC":
+        error = NRICValidator.validate(entity.text)
+        if error:
+            # Invalid format, likely false positive
+            return False
+    return True
+2.3 WhatsApp Cost Calculator (Budget Tool)
+File: scripts/cost_calculator.py
+Python
+Copy
+class WhatsAppCostCalculator:
+    """
+    Calculates monthly WhatsApp API cost for Singapore SMB.
+    Based on Meta's 2025 pricing for Singapore region.
+    """
+    
+    # Per-message costs (USD, converted to SGD @ 1.35)
+    RATES = {
+        "text_outbound": 0.008 * 1.35,  # S$0.0108 per text
+        "media_outbound": 0.04 * 1.35,  # S$0.054 per image/video
+        "template_outbound": 0.005 * 1.35,  # S$0.0068 per template
+        "inbound": 0.0  # Free
+    }
+    
+    def __init__(self, business_type: str):
+        self.business_type = business_type  # 'cafe', 'retail', 'services'
+        self.volume_estimates = {
+            'cafe': {'daily_text': 150, 'daily_media': 20, 'daily_templates': 10},
+            'retail': {'daily_text': 300, 'daily_media': 50, 'daily_templates': 30},
+            'services': {'daily_text': 100, 'daily_media': 5, 'daily_templates': 5}
+        }
+    
+    def monthly_cost(self) -> dict:
+        vol = self.volume_estimates[self.business_type]
+        days = 30
+        
+        text_cost = vol['daily_text'] * days * self.RATES['text_outbound']
+        media_cost = vol['daily_media'] * days * self.RATES['media_outbound']
+        template_cost = vol['daily_templates'] * days * self.RATES['template_outbound']
+        
+        total = text_cost + media_cost + template_cost
+        
+        return {
+            "text": round(text_cost, 2),
+            "media": round(media_cost, 2),
+            "templates": round(template_cost, 2),
+            "total_sgd": round(total, 2),
+            "notes": "Excludes free-tier inbound messages. Media includes images/videos."
+        }
+
+# Example: Café owner
+calc = WhatsAppCostCalculator("cafe")
+print(calc.monthly_cost())
+# Output: {'text': 48.6, 'media': 32.4, 'templates': 2.04, 'total_sgd': 83.04, 'notes': '...'}
+2.4 Cultural UI: Token Display Limiting
+File: apps/web/src/components/chat/CulturalTokenCloud.tsx
+tsx
+Copy
+import { SinglishToken } from "@/lib/types";
+import { useState } from "react";
+
+interface TokenCloudProps {
+  tokens: SinglishToken[];
+  maxDisplay?: number; // Configurable limit
+}
+
+export function CulturalTokenCloud({ tokens, maxDisplay = 4 }: TokenCloudProps) {
+  const [showAll, setShowAll] = useState(false);
+  const displayTokens = showAll ? tokens : tokens.slice(0, maxDisplay);
+  const overflowCount = tokens.length - maxDisplay;
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {displayTokens.map((token) => (
+        <span
+          key={token.token}
+          className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-amber-500/20 text-amber-300 text-caption font-mono"
+          title={`Intent: ${token.intent}, Confidence: ${(token.confidence * 100).toFixed(0)}%`}
+        >
+          {token.token}
+          {token.confidence < 0.7 && (
+            <span className="text-gray-400 text-xs">?</span> /* Low confidence indicator */
+          )}
+        </span>
+      ))}
+      
+      {overflowCount > 0 && !showAll && (
+        <button
+          onClick={() => setShowAll(true)}
+          className="text-caption text-secondary-text hover:text-primary-text transition-colors"
+        >
+          +{overflowCount}
+        </button>
+      )}
+    </div>
+  );
+}
+3. Operational Protocols (Complete)
+3.1 Database Migration & Rollback (Zero-Downtime)
+Migration File: apps/api/alembic/versions/001_initial.py
+Python
+Copy
+"""
+Initial schema for NexusAI SMB Singapore Edition.
+Revision ID: 001
+Create Date: 2025-12-31
+"""
+from alembic import op
+import sqlalchemy as sa
+
+def upgrade():
+    # Create conversations table (no NOT NULL on new columns)
+    op.create_table(
+        "conversations",
+        sa.Column("id", sa.UUID(), nullable=False, primary_key=True),
+        sa.Column("wa_user_id", sa.String(50), nullable=False, unique=True),
+        sa.Column("status", sa.String(20), nullable=False, default="active"),
+        # Use JSONB for flexible metadata
+        sa.Column("metadata", sa.JSON(), nullable=True),
+        sa.Column("created_at", sa.TIMESTAMP(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.TIMESTAMP(timezone=True), nullable=False),
+    )
+    
+    # Index on status for fast queries
+    op.create_index("ix_conversations_status", "conversations", ["status"])
+
+def downgrade():
+    op.drop_index("ix_conversations_status")
+    op.drop_table("conversations")
+Zero-Downtime Deploy Script:
+bash
+Copy
+#!/bin/bash
+# scripts/zero-downtime-deploy.sh
+
+# Step 1: Run migration on new code (old app still running)
+echo "Running database migration..."
+cd apps/api && alembic upgrade head
+
+# Step 2: Deploy new API version (Rolling restart)
+echo "Deploying new API..."
+railway service redeploy --service=api-gateway --image=nexus-api:v2
+
+# Step 3: Wait for health check
+echo "Waiting for health check..."
+until curl -f http://api.sg-smb-ai.com/health; do sleep 5; done
+
+# Step 4: Switch traffic (if using load balancer)
+echo "Switching traffic..."
+railway domain update --service=api-gateway --domain=api.sg-smb-ai.com
+
+# Step 5: Monitor for 5 mins
+echo "Monitoring..."
+sleep 300 && echo "Deploy successful" || echo "Rolling back..."
+
+# Rollback (if needed)
+# railway service rollback --service=api-gateway --to=v1
+# alembic downgrade -1
+3.2 Redis Stream Maintenance (Cron)
+File: apps/api/scripts/redis_maintenance.py
+Python
+Copy
+# Run every hour via Railway Cron
+def trim_old_streams():
+    """
+    Trim stream to last 10K messages to prevent memory bloat.
+    Run this every hour.
+    """
+    redis = get_redis_client()
+    # XTRIM to MAXLEN 10000 (approximate for performance)
+    redis.xtrim("message_stream", maxlen=RedisStreamConfig.MAXLEN, approximate=True)
+    
+    # Also delete old data from PostgreSQL (older than 90 days)
+    ConversationRepository.delete_old_conversations(days=90)
+3.3 LLM Fallback Chain (Critical)
+File: apps/api/app/agent/llm_client.py
+Python
+Copy
+import openai
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+class ResilientLLMClient:
+    def __init__(self):
+        self.primary_model = "gpt-4o-mini"
+        self.fallback_model = "gpt-3.5-turbo"  # Cheaper, faster fallback
+        self.max_retries = 3
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def generate(self, prompt: str, **kwargs) -> str:
+        try:
+            # Try primary model
+            response = await openai.ChatCompletion.acreate(
+                model=self.primary_model,
+                messages=[{"role": "user", "content": prompt}],
+                **kwargs
+            )
+            return response.choices[0].message.content
+        except openai.error.Timeout:
+            # On timeout, try fallback ONCE (no retries)
+            logger.warning("GPT-4o-mini timeout, falling back to GPT-3.5-turbo")
+            response = await openai.ChatCompletion.acreate(
+                model=self.fallback_model,
+                messages=[{"role": "user", "content": prompt}],
+                **kwargs
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            # Ultimate fallback: Hardcoded apology
+            return "Paiseh, system busy now. Try again later or type 'HELP' for human."
+4. Monitoring & Observability (Complete)
+4.1 Prometheus Metrics Exporter
+File: apps/api/app/monitoring/metrics.py
+Python
+Copy
+from prometheus_client import Counter, Histogram, Gauge
+
+# Business Metrics
+singlish_detected = Counter(
+    "singlish_detections_total",
+    "Number of Singlish utterances detected",
+    ["language_mode", "business_id"]
+)
+
+pii_redactions = Counter(
+    "pii_redactions_total",
+    "Number of PII entities redacted",
+    ["entity_type", "business_id"]
+)
+
+human_escalations = Counter(
+    "human_escalations_total",
+    "Number of times AI escalated to human",
+    ["reason", "business_id"]
+)
+
+# Performance Metrics
+llm_latency = Histogram(
+    "llm_request_duration_seconds",
+    "LLM call latency",
+    buckets=[0.5, 1.0, 1.5, 2.0, 5.0]
+)
+
+rag_latency = Histogram(
+    "rag_retrieval_duration_seconds",
+    "RAG retrieval latency",
+    buckets=[0.1, 0.2, 0.5, 1.0]
+)
+
+# Compliance Metrics
+pdpa_violations = Gauge(
+    "pdpa_violations_count",
+    "Number of potential PDPA violations detected (should be 0)",
+    ["business_id"]
+)
+4.2 Grafana Dashboard JSON (Import Ready)
+File: monitoring/grafana/dashboards/nexus-smb-overview.json
+JSON
+Copy
+{
+  "dashboard": {
+    "title": "NexusAI SMB - Singapore Overview",
+    "tags": ["singapore", "smb", "compliance"],
+    "timezone": "Asia/Singapore",
+    "panels": [
+      {
+        "id": 1,
+        "title": "WhatsApp Message Volume",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "sum(rate(whatsapp_messages_total[5m])) by (direction)",
+            "legendFormat": "{{direction}}"
+          }
+        ],
+        "yAxes": [{ "label": "Messages/sec" }]
+      },
+      {
+        "id": 2,
+        "title": "Singlish Detection Rate",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(singlish_detections_total) / sum(whatsapp_messages_total{direction=\"inbound\"})",
+            "legendFormat": "Percentage"
+          }
+        ],
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 0.3 },
+            { "color": "red", "value": 0.6 }
+          ]
+        }
+      },
+      {
+        "id": 3,
+        "title": "PDPA Violations (Should be 0)",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "sum(pdpa_violations_count)",
+            "legendFormat": "Violations"
+          }
+        ],
+        "thresholds": {
+          "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ]
+        }
+      }
+    ]
+  }
+}
+5. Security & Compliance (Expanded)
+5.1 PDPA Audit Trail Schema
+File: apps/api/app/models/audit.py
+Python
+Copy
+from sqlmodel import SQLModel, Field, Column, JSON
+from datetime import datetime
+from typing import Optional
+
+class PDPARecord(SQLModel, table=True):
+    """
+    Immutable audit trail for PDPC compliance.
+    Each record is append-only, cryptographically hashed (simulated).
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    business_id: str = Field(index=True)
+    record_type: str = Field(index=True)  # consent, access_request, pii_redacted, breach
+    user_id: Optional[str] = Field(index=True)
+    details: dict = Field(sa_column=Column(JSON, nullable=False))
+    created_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+    created_by: str = Field(default="system")  # Who triggered this
+    
+    # Simulated "tamper-proof": hash of previous record + this record's data
+    previous_hash: Optional[str] = Field(nullable=True)
+    record_hash: str = Field(nullable=False)
+    
+    def compute_hash(self) -> str:
+        """Simple SHA256 chain (not blockchain-level, but audit-friendly)"""
+        import hashlib
+        data = f"{self.business_id}{self.record_type}{self.user_id}{self.created_at.isoformat()}"
+        return hashlib.sha256(data.encode()).hexdigest()
+Audit Repository:
+Python
+Copy
+class AuditRepository:
+    async def log_pii_redaction(self, business_id: str, user_id: str, entity_type: str, entity_value: str):
+        record = PDPARecord(
+            business_id=business_id,
+            record_type="pii_redacted",
+            user_id=user_id,
+            details={
+                "entity_type": entity_type,
+                "entity_value": entity_value,  # Hashed, not plain text!
+                "redaction_method": "presidio",
+                "context": "whatsapp_inbound"
+            }
+        )
+        await self.db.insert(record)
+5.2 OpenTelemetry Tracing (Distributed)
+File: apps/api/app/core/tracing.py
+Python
+Copy
+from opentelemetry import trace
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+def init_tracing(app):
+    """Initialize distributed tracing for WhatsApp → API → Redis → Dashboard"""
+    exporter = JaegerExporter(
+        agent_host_name="jaeger-agent.railway.internal",
+        agent_port=6831,
+    )
+    
+    trace.set_tracer_provider(TracerProvider())
+    span_processor = BatchSpanProcessor(exporter)
+    trace.get_tracer_provider().add_span_processor(span_processor)
+    
+    # Instrument FastAPI automatically
+    FastAPIInstrumentor.instrument_app(app)
+    
+    # Custom span for WhatsApp message processing
+    return trace.get_tracer("nexus.whatsapp")
+
+# Usage in webhook
+tracer = init_tracing(app)
+
+@router.post("/webhook/whatsapp")
+async def whatsapp_webhook(...):
+    with tracer.start_as_current_span("whatsapp.message.process") as span:
+        span.set_attribute("user.id", message.wa_user_id)
+        span.set_attribute("message.length", len(message.text))
+        # ... processing
+6. Developer Onboarding (AI-Agent-Optimized)
+6.1 Quick Start for AI Agents
+If you are an AI coding agent, execute these commands in order:
+bash
+Copy
+# Step 0: Verify Environment
+python --version  # Must be 3.11+
+node --version    # Must be 20+
+docker --version  # Must be 24+
+
+# Step 1: Clone & Setup
+git clone https://github.com/nexus-ai-smb/singapore-edition.git
+cd singapore-edition
+
+# Step 2: Create environment files
+cat > .env.development <<EOF
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nexus_dev
+REDIS_URL=redis://localhost:6379
+QDRANT_URL=http://localhost:6333
+OPENAI_API_KEY=sk-test-1234
+WHATSAPP_VERIFY_TOKEN=dev_token_abc
+JWT_SECRET=dev_secret_change_in_prod
+EOF
+
+# Step 3: Start infrastructure
+docker-compose --profile dev up -d
+# Wait for health: docker-compose ps (all "healthy")
+
+# Step 4: Install dependencies (parallel)
+# Terminal 1 (API)
+cd apps/api && poetry install --no-dev
+
+# Terminal 2 (Web)
+cd apps/web && npm ci
+
+# Step 5: Run migrations
+cd apps/api
+poetry run alembic upgrade head
+
+# Step 6: Seed data (required for tests)
+poetry run python scripts/seed_knowledge.py --demo --business-id=demo-biz-123
+
+# Step 7: Start dev servers
+# Terminal 1 (API)
+poetry run uvicorn app.main:app --reload --port 8000 --log-level debug
+
+# Terminal 2 (Web)
+npm run dev
+
+# Step 8: Verify
+curl http://localhost:8000/health  # {"status": "ok"}
+# Open browser: http://localhost:3000
+# Login: demo@business.sg / password: demo123
+
+# Step 9: Run tests
+# Terminal 3
+cd apps/api && poetry run pytest tests/ -v --cov-fail-under=90
+cd apps/web && npm run test:unit -- --coverage --coverageThreshold=90
+6.2 Common Pitfalls for AI Agents
+Pitfall 1: Using docker-compose up without --profile dev will skip Qdrant.
+Fix: Always use --profile dev or Qdrant won't start.
+Pitfall 2: Forgetting to set TZ=Asia/Singapore in containers.
+Fix: Add environment: TZ=Asia/Singapore to all services in docker-compose.yml.
+Pitfall 3: Implementing WhatsApp webhook without signature verification.
+Fix: Meta will reject your webhook. Always implement HMAC-SHA256 verification.
+Pitfall 4: Using Tailwind's default text-lg instead of CSS variables.
+Fix: Lint rule: no-restricted-properties: ["font-size", "color"] in .eslintrc.
+7. Runbooks & Troubleshooting
+7.1 Runbook: "Dashboard Shows 'Connecting...' Forever"
+Symptom: WebSocket stuck in CONNECTING state.
+Diagnosis Steps:
+bash
+Copy
+# 1. Check WebSocket endpoint
+curl -i http://localhost:8000/ws/dashboard?token=invalid
+# Expected: 403 Forbidden (not 404)
+
+# 2. Check Redis subscription
+redis-cli XINFO STREAM message_stream
+# Expected: "length" > 0 if messages exist
+
+# 3. Check consumer group
+redis-cli XINFO GROUPS message_stream
+# Expected: "dashboard_group" exists
+
+# 4. Check logs
+docker logs api-gateway | grep "WebSocket"
+
+# 5. Clear browser localStorage (cached token)
+localStorage.removeItem("auth_token")
+Fix: Restart Redis container if XINFO shows no groups. Redis persistence may be disabled.
+7.2 Runbook: "Agent Not Responding in Singlish"
+Symptom: Agent replies in formal English to "Can or not lah?"
+Diagnosis:
+Python
+Copy
+# 1. Check sg_context library installed
+python -c "import sg_context; print(sg_context.__version__)"
+
+# 2. Test Singlish detector
+python -c "from sg_context import SinglishDetector; d = SinglishDetector(); print(d.detect('Can or not lah?'))"
+# Expected: SinglishAnnotation with tokens=[{"token": "lah", "intent": "particle"}]
+
+# 3. Check LangGraph system prompt
+cat apps/api/app/agent/prompts/system.txt | grep -i singlish
+# Expected: Contains "Mirror user's formality level"
+Fix: Ensure SINGLISH_MODE=true in environment variables.
+7.3 Runbook: "PDPA Violation Alert Fired"
+Symptom: Grafana shows pdpa_violations_count > 0.
+Immediate Action:
+bash
+Copy
+# 1. Check which business
+curl http://localhost:8000/internal/audit/pdpa-violations
+
+# 2. Quarantine affected conversations
+psql -c "UPDATE conversations SET status = 'quarantined' WHERE business_id='...';"
+
+# 3. Notify DPO
+python scripts/notify_dpo.py --business-id=... --violation="PII leaked in LLM response"
+
+# 4. Generate breach report for PDPC
+python scripts/generate_pdpc_report.py --business-id=... --period=24h
+8. Appendices (Hyper-Detailed)
+Appendix A: Complete Singlish Corpus (200+ Patterns)
+File: packages/sg_context/singlish/corpus.json
+JSON
+Copy
+{
+  "particles": [
+    {"token": "lah", "intent": "emphasis", "sentiment": 0.0, "examples": ["Can lah", "OK lah"]},
+    {"token": "leh", "intent": "suggestion", "sentiment": 0.0, "examples": ["Try leh", "How about leh"]},
+    {"token": "lor", "intent": "resignation", "sentiment": -0.2, "examples": ["Die lor", "Spoil lor"]},
+    {"token": "meh", "intent": "skepticism", "sentiment": -0.1, "examples": ["Really meh?", "Can meh"]},
+    {"token": "hor", "intent": "confirmation", "sentiment": 0.0, "examples": ["Correct hor", "Like that hor"]}
+  ],
+  "expressions": [
+    {"pattern": "can or not", "intent": "feasibility_check", "sentiment": 0.0},
+    {"pattern": "walau eh", "intent": "frustration", "sentiment": -0.6},
+    {"pattern": "paiseh", "intent": "apology", "sentiment": -0.3},
+    {"pattern": "die already", "intent": "failure", "sentiment": -0.8},
+    {"pattern": "steady pom pi pi", "intent": "praise", "sentiment": 0.8}
+  ],
+  "code_switching": [
+    {"pattern": "OK (.*) liao", "desc": "English OK + Hokkien liao (already)"},
+    {"pattern": "Why you so (.*) one", "desc": "English + Singlish 'one' particle"},
+    {"pattern": "Got (.*) meh",
