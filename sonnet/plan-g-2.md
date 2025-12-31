@@ -261,3 +261,253 @@ This is where the **Avant-Garde** design shines. This is for the SMB Owner.
 I will execute this with **Library Discipline** (Shadcn/Radix), **Intentional Minimalism** (No fluff, just data), and **Deep Reasoning** (Every architectural choice justifies the Singapore context).
 
 ---
+
+# Project Architecture Document (PAD)
+**Project Name:** NexusAI SMB (Singapore Edition)
+**Version:** 1.0.0-Stable
+**Status:** Ready for Implementation
+**Target Audience:** AI Coding Agents / Senior Developers
+**Architecture Style:** Modular Monolith (Event-Driven Internal)
+
+---
+
+## 1. Executive Summary & Vision
+
+### 1.1 Project Vision
+To engineer a **context-aware, multilingual Customer Service AI Agent** specifically architected for Singapore SMBs. The system moves beyond generic Q&A to handle complex, multi-turn conversations via **WhatsApp (primary channel)** while maintaining strict **PDPA compliance** and **Singlish fluency**.
+
+### 1.2 Core Design Philosophy: "Tropical Pragmatism"
+*   **Cultural Intelligence:** The system must distinguish between "Can I return?" (Policy) and "Can or not?" (Feasibility/Permission) using a dedicated Singlish NLP layer.
+*   **Regulatory First:** Privacy is not a plugin. PII masking (NRIC/FIN/Mobile) happens *before* data touches the LLM or Database.
+*   **Channel Reality:** Singapore runs on WhatsApp. The web interface is primarily a **Command Center** for business owners, not the chat interface for customers.
+*   **Anti-Generic Aesthetic:** The Command Center features a "Midnight Precision" aesthetic—dark mode, high-contrast data, monospace typography, and zero "AI slop" gradients.
+
+### 1.3 Success Metrics (KPIs)
+*   **TTFT (Time to First Token):** <1.5s (via WebSocket/Streaming).
+*   **Deflection Rate:** >40% of queries resolved without human intervention.
+*   **Compliance:** 100% PII Redaction in logs.
+*   **Cost:** <$300/month operational cost (Self-hosted Vector DB + GPT-4o-mini).
+
+---
+
+## 2. System Architecture
+
+### 2.1 High-Level Architecture Diagram
+
+```mermaid
+graph TD
+    %% External Actors
+    User((Customer)) -->|WhatsApp| Meta[Meta Cloud API]
+    Owner((Biz Owner)) -->|HTTPS| Dashboard[Next.js Command Center]
+
+    %% Infrastructure Layer (AWS Singapore ap-southeast-1)
+    subgraph "Infrastructure (Docker/ECS)"
+        
+        %% API Gateway & Webhooks
+        Meta -->|Webhook| API[FastAPI Gateway]
+        Dashboard -->|REST/WS| API
+
+        %% The Brain (Backend)
+        subgraph "Nexus Backend (Python)"
+            Middleware[PDPA Middleware]
+            Router{Intent Router}
+            
+            subgraph "LangGraph Agent"
+                NodeIntent[Intent Classifier]
+                NodeRAG[RAG Retriever]
+                NodeReason[Reasoning Engine]
+                NodeResponse[Response Generator]
+            end
+            
+            SGContext[SG Context Lib]
+        end
+
+        %% Data Layer
+        DB[(PostgreSQL)]
+        Vector[(Qdrant)]
+        Cache[(Redis)]
+
+        %% Integrations
+        API --> Middleware
+        Middleware --> Router
+        Router --> NodeIntent
+        
+        NodeIntent -->|Singlish?| SGContext
+        NodeIntent -->|Policy Query| NodeRAG
+        NodeRAG --> Vector
+        NodeReason -->|History/State| DB
+        NodeReason -->|LLM API| OpenAI[OpenAI GPT-4o-mini]
+        
+        NodeResponse --> Cache
+    end
+
+    %% Data Flow
+    API -->|Async Task| DB
+```
+
+### 2.2 Data Flow Lifecycle
+1.  **Ingestion:** WhatsApp Webhook $\to$ FastAPI $\to$ PII Redaction (Presidio).
+2.  **State Hydration:** Fetch conversation history from Redis (Hot) or Postgres (Cold).
+3.  **Cultural Norming:** `SGContext` library analyzes text. If "Singlish" detected, inject `persona: local_friendly` into LLM context.
+4.  **Reasoning (LangGraph):**
+    *   *Retrieval:* Query Qdrant for policy/inventory.
+    *   *Synthesis:* Generate response using GPT-4o-mini.
+    *   *Compliance Check:* Verify output doesn't hallucinate or leak PII.
+5.  **Delivery:** Send response to WhatsApp API + Push update to Dashboard via WebSocket.
+
+---
+
+## 3. Technology Stack
+
+| Layer | Technology | Version | Rationale |
+| :--- | :--- | :--- | :--- |
+| **Frontend** | Next.js | 15.0+ | App Router, Server Actions, React Server Components. |
+| **Styling** | Tailwind CSS | 4.0 | "Midnight Precision" design system. |
+| **UI Kit** | Shadcn/UI | Latest | Accessible, headless primitives for bespoke styling. |
+| **Backend** | Python (FastAPI) | 3.12+ | Async native, tight integration with AI libraries. |
+| **Orchestration**| LangGraph | 0.1+ | Stateful, cyclical agent workflows (superior to Chains). |
+| **Database** | PostgreSQL | 16+ | Relational data, User auth, Audit logs. |
+| **Vector DB** | Qdrant | Latest | Rust-based, high performance, self-hostable (Cost). |
+| **Cache** | Redis | 7+ | Conversation state, Rate limiting. |
+| **PII/NLP** | Microsoft Presidio | Latest | NRIC/FIN detection patterns. |
+
+---
+
+## 4. Module Specifications
+
+### 4.1 Singapore Context Library (`src/sg_context`)
+**Objective:** A standalone Python module to handle local nuances.
+*   **`singlish_detector.py`:** Regex + Keyword scoring (e.g., "can or not", "liao", "walau").
+*   **`regulations.py`:** Hardcoded corpus of PDPA obligations and GST (9%) calculation utilities.
+*   **`pii_patterns.py`:** Custom recognizers for Singapore NRIC (`[S|T|F|G]\d{7}[A-Z]`) and Phone (`+65`).
+
+### 4.2 The "Command Center" Dashboard
+**Objective:** Operational oversight for the SMB owner.
+*   **Live Intercept:** Real-time view of WhatsApp chats. Button to "Pause AI" and take over typing.
+*   **Grant Reporter:** Automated PDF generation of "Productivity Metrics" (Hours saved vs. Manual typing) for PSG Grant auditing.
+*   **Design System:**
+    *   *Font:* `Inter` (UI), `JetBrains Mono` (Data).
+    *   *Colors:* Navy (`#0f172a`), Teal (`#14b8a6`), Alert Orange (`#f97316`).
+
+### 4.3 Agent Cognition (LangGraph)
+**Structure:**
+*   **State:** `messages`, `user_profile`, `singlish_mode` (bool), `intent`.
+*   **Nodes:**
+    1.  `guardrails`: Check for PII/toxicity.
+    2.  `classify`: Determine intent (Support vs. Sales vs. Complaint).
+    3.  `retrieve`: Hybrid search (Keyword + Vector) in Qdrant.
+    4.  `generate`: LLM call with system prompt injection based on `singlish_mode`.
+
+---
+
+## 5. Data Architecture
+
+### 5.1 PostgreSQL Schema
+```sql
+-- Users (Customers)
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wa_phone_id VARCHAR(50) UNIQUE NOT NULL, -- WhatsApp ID
+    name VARCHAR(100),
+    language_pref VARCHAR(10) DEFAULT 'en-SG',
+    tags TEXT[], -- ['vip', 'complainer', 'repeat']
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Audit Logs (For PSG Grants & Compliance)
+CREATE TABLE audit_logs (
+    id SERIAL PRIMARY KEY,
+    conversation_id UUID REFERENCES conversations(id),
+    action_type VARCHAR(50), -- 'pii_redacted', 'human_takeover', 'auto_reply'
+    original_text TEXT, -- Encrypted at rest
+    redacted_text TEXT,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+```
+
+### 5.2 Qdrant Payload Schema
+```json
+{
+  "content": "Our return policy allows 7 days...",
+  "metadata": {
+    "source": "policy_doc_v2.pdf",
+    "category": "returns",
+    "valid_from": "2025-01-01",
+    "language": "en" 
+  }
+}
+```
+
+---
+
+## 6. Implementation Roadmap
+
+### Phase 1: Foundation (Days 1-3)
+1.  **Repo Setup:** Monorepo structure (`apps/web`, `apps/api`, `packages/sg-context`).
+2.  **Infrastructure:** `docker-compose.yml` for Postgres, Redis, Qdrant.
+3.  **SG Context Lib:** Implement NRIC regex and Singlish keywords.
+4.  **Database:** Run SQL migrations.
+
+### Phase 2: The Brain (Days 4-7)
+1.  **Ingestion Pipeline:** Python script to parse PDFs $\to$ Chunk $\to$ Qdrant.
+2.  **FastAPI Core:** Setup WhatsApp Webhook verification endpoint.
+3.  **LangGraph:** Implement the basic `Retrieve` $\to$ `Generate` flow.
+
+### Phase 3: The Interface (Days 8-12)
+1.  **Next.js Setup:** Install Tailwind 4 & Shadcn. Apply "Midnight Precision" theme.
+2.  **Dashboard:** Build "Live Chat" view using WebSocket connection to FastAPI.
+3.  **Auth:** Simple Admin login for the business owner.
+
+### Phase 4: Integration & Polish (Days 13-14)
+1.  **WhatsApp Connection:** Connect Meta App to ngrok/prod URL.
+2.  **End-to-End Test:** Simulate "Angry Uncle" scenario (Singlish complaint).
+3.  **Grant Report:** Generate the PDF export.
+
+---
+
+## 7. Developer Guidelines (The "Anti-Generic" Pledge)
+
+*   **No "AI Slop":** Do not use generic skeleton loaders or default Vercel themes. Create bespoke, data-dense loading states (e.g., "Initializing Neural Link...").
+*   **Strict Typing:** Python must use `Pydantic` models for everything. TypeScript must be strict.
+*   **Error Handling:** Never fail silently. If the LLM times out, fallback to a hardcoded "system busy" message in Singlish: *"Eh paiese, system lag a bit. Wait ah."*
+
+---
+
+## 8. Directory Structure (Reference)
+
+```text
+nexus-ai-smb/
+├── docker-compose.yml
+├── .env.example
+├── apps/
+│   ├── web/ (Next.js 15)
+│   │   ├── src/app/dashboard/
+│   │   ├── src/components/ui/ (Shadcn)
+│   │   └── tailwind.config.ts
+│   └── api/ (FastAPI)
+│       ├── app/main.py
+│       ├── app/agent/ (LangGraph)
+│       └── app/routers/
+├── packages/
+│   └── sg_context/ (Python Lib)
+│       ├── __init__.py
+│       ├── pii.py
+│       └── singlish.py
+└── scripts/
+    └── ingest_knowledge.py
+```
+
+---
+
+## 9. Deployment Strategy
+
+*   **Dev:** Docker Compose (Localhost).
+*   **Prod (SMB Friendly):**
+    *   **Backend/DB:** Railway or Render (Combined service ~ $15/mo).
+    *   **Frontend:** Vercel (Free/Pro).
+    *   **LLM:** OpenAI API (Pay-per-use).
+    *   **Total Target:** < $50/mo infrastructure cost.
+
+---
+
+This document serves as the **Single Source of Truth**. Any deviation from the "Singapore-First" or "Avant-Garde" principles requires explicit architectural review.
